@@ -197,5 +197,15 @@ output AZURE_AI_SEARCH_SERVICE_NAME string = aiProject.outputs.dependentResource
 output AZURE_STORAGE_CONNECTION_NAME string = aiProject.outputs.dependentResources.storage.connectionName
 output AZURE_STORAGE_ACCOUNT_NAME string = aiProject.outputs.dependentResources.storage.accountName
 
+// Azure AI Document Intelligence
+output AZURE_DOCUMENT_INTELLIGENCE_NAME string = aiProject.outputs.dependentResources.document_intelligence.name
+output AZURE_DOCUMENT_INTELLIGENCE_ENDPOINT string = aiProject.outputs.dependentResources.document_intelligence.endpoint
+output AZURE_DOCUMENT_INTELLIGENCE_CONNECTION_NAME string = aiProject.outputs.dependentResources.document_intelligence.connectionName
+
+// Azure AI Content Understanding
+output AZURE_CONTENT_UNDERSTANDING_NAME string = aiProject.outputs.dependentResources.content_understanding.name
+output AZURE_CONTENT_UNDERSTANDING_ENDPOINT string = aiProject.outputs.dependentResources.content_understanding.endpoint
+output AZURE_CONTENT_UNDERSTANDING_CONNECTION_NAME string = aiProject.outputs.dependentResources.content_understanding.connectionName
+
 // Connections
 output AI_PROJECT_CONNECTION_IDS_JSON string = string(aiProject.outputs.connectionIds)

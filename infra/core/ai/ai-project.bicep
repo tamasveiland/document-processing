@@ -74,6 +74,8 @@ var shouldCreateAppInsights = enableMonitoring && !hasExistingAppInsightsConnect
 var hasSearchConnection = length(filter(additionalDependentResources, conn => conn.resource == 'azure_ai_search')) > 0
 var hasBingConnection = length(filter(additionalDependentResources, conn => conn.resource == 'bing_grounding')) > 0
 var hasBingCustomConnection = length(filter(additionalDependentResources, conn => conn.resource == 'bing_custom_grounding')) > 0
+var hasDocIntelligenceConnection = length(filter(additionalDependentResources, conn => conn.resource == 'document_intelligence')) > 0
+var hasContentUnderstandingConnection = length(filter(additionalDependentResources, conn => conn.resource == 'content_understanding')) > 0
 
 // Extract connection names from ai.yaml for each resource type
 var storageConnectionName = hasStorageConnection ? filter(additionalDependentResources, conn => conn.resource == 'storage')[0].connectionName : ''
@@ -81,6 +83,8 @@ var acrConnectionName = hasAcrConnection ? filter(additionalDependentResources, 
 var searchConnectionName = hasSearchConnection ? filter(additionalDependentResources, conn => conn.resource == 'azure_ai_search')[0].connectionName : ''
 var bingConnectionName = hasBingConnection ? filter(additionalDependentResources, conn => conn.resource == 'bing_grounding')[0].connectionName : ''
 var bingCustomConnectionName = hasBingCustomConnection ? filter(additionalDependentResources, conn => conn.resource == 'bing_custom_grounding')[0].connectionName : ''
+var docIntelligenceConnectionName = hasDocIntelligenceConnection ? filter(additionalDependentResources, conn => conn.resource == 'document_intelligence')[0].connectionName : ''
+var contentUnderstandingConnectionName = hasContentUnderstandingConnection ? filter(additionalDependentResources, conn => conn.resource == 'content_understanding')[0].connectionName : ''
 
 // Enable monitoring via Log Analytics and Application Insights
 module logAnalytics '../monitor/loganalytics.bicep' = if (shouldCreateAppInsights) {
@@ -332,6 +336,36 @@ module bingCustomGrounding '../search/bing_custom_grounding.bicep' = if (hasBing
   }
 }
 
+// Azure AI Document Intelligence module - deploy if document intelligence connection is defined
+module documentIntelligence './document_intelligence.bicep' = if (hasDocIntelligenceConnection) {
+  name: 'document-intelligence'
+  params: {
+    tags: tags
+    resourceName: '${abbrs.cognitiveServicesFormRecognizer}${resourceToken}'
+    connectionName: docIntelligenceConnectionName
+    aiServicesAccountName: aiAccount.name
+    aiProjectName: aiAccount::project.name
+    principalId: principalId
+    principalType: principalType
+    location: location
+  }
+}
+
+// Azure AI Content Understanding module - deploy if content understanding connection is defined
+module contentUnderstanding './content_understanding.bicep' = if (hasContentUnderstandingConnection) {
+  name: 'content-understanding'
+  params: {
+    tags: tags
+    resourceName: 'cog-cu-${resourceToken}'
+    connectionName: contentUnderstandingConnectionName
+    aiServicesAccountName: aiAccount.name
+    aiProjectName: aiAccount::project.name
+    principalId: principalId
+    principalType: principalType
+    location: location
+  }
+}
+
 // Azure AI Search module - deploy if search connection is defined in ai.yaml
 module azureAiSearch '../search/azure_ai_search.bicep' = if (hasSearchConnection) {
   name: 'azure-ai-search'
@@ -393,6 +427,18 @@ output dependentResources object = {
     accountName: hasStorageConnection ? storage!.outputs.storageAccountName : ''
     connectionName: hasStorageConnection ? storage!.outputs.storageConnectionName : ''
   }
+  document_intelligence: {
+    name: hasDocIntelligenceConnection ? documentIntelligence!.outputs.documentIntelligenceName : ''
+    endpoint: hasDocIntelligenceConnection ? documentIntelligence!.outputs.documentIntelligenceEndpoint : ''
+    connectionName: hasDocIntelligenceConnection ? documentIntelligence!.outputs.documentIntelligenceConnectionName : ''
+    connectionId: hasDocIntelligenceConnection ? documentIntelligence!.outputs.documentIntelligenceConnectionId : ''
+  }
+  content_understanding: {
+    name: hasContentUnderstandingConnection ? contentUnderstanding!.outputs.contentUnderstandingName : ''
+    endpoint: hasContentUnderstandingConnection ? contentUnderstanding!.outputs.contentUnderstandingEndpoint : ''
+    connectionName: hasContentUnderstandingConnection ? contentUnderstanding!.outputs.contentUnderstandingConnectionName : ''
+    connectionId: hasContentUnderstandingConnection ? contentUnderstanding!.outputs.contentUnderstandingConnectionId : ''
+  }
 }
 
 type deploymentsType = {
@@ -423,7 +469,7 @@ type deploymentsType = {
 
 type dependentResourcesType = {
   @description('The type of dependent resource to create')
-  resource: 'storage' | 'registry' | 'azure_ai_search' | 'bing_grounding' | 'bing_custom_grounding'
+  resource: 'storage' | 'registry' | 'azure_ai_search' | 'bing_grounding' | 'bing_custom_grounding' | 'document_intelligence' | 'content_understanding'
   
   @description('The connection name for this resource')
   connectionName: string
