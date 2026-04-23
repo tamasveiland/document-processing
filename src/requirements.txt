@@ -3,5 +3,5 @@ azure-ai-contentunderstanding>=1.0.0
 azure-ai-documentintelligence>=1.0.0
 azure-identity>=1.17.0
 azure-mgmt-cognitiveservices>=13.0.0
-pymupdf>=1.25.0
+pypdfium2>=4.0.0
 python-dotenv>=1.0.0

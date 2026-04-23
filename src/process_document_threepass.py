@@ -42,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import cast
 
-import pymupdf  # PyMuPDF
+import pypdfium2 as pdfium  # PDF operations (Apache-2.0)
 from azure.ai.contentunderstanding import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import (
     AnalysisResult,
@@ -182,24 +182,19 @@ def _detect_table_pages_from_markdown(doc: DocumentContent) -> set[int]:
 
 
 def _detect_table_pages_pymupdf(pdf_path: Path) -> set[int]:
-    """Detect pages likely containing tables using PyMuPDF tab detection."""
-    doc = pymupdf.open(pdf_path)
+    """Detect pages likely containing tables using text heuristics."""
+    doc = pdfium.PdfDocument(pdf_path)
     pages: set[int] = set()
     for idx in range(len(doc)):
         page = doc[idx]
-        # PyMuPDF table finder
-        try:
-            tables = page.find_tables()
-            if tables and len(tables.tables) > 0:
-                pages.add(idx + 1)
-        except Exception:  # noqa: BLE001
-            # find_tables may not be available in all PyMuPDF versions;
-            # fall back to text heuristic: many tab-separated columns
-            text = page.get_text("text")
-            lines = text.split("\n")
-            tab_lines = sum(1 for ln in lines if ln.count("\t") >= 2 or ln.count("  ") >= 4)
-            if tab_lines >= 3:
-                pages.add(idx + 1)
+        textpage = page.get_textpage()
+        text = textpage.get_text_range()
+        textpage.close()
+        page.close()
+        lines = text.split("\n")
+        tab_lines = sum(1 for ln in lines if ln.count("\t") >= 2 or ln.count("  ") >= 4)
+        if tab_lines >= 3:
+            pages.add(idx + 1)
     doc.close()
     return pages
 
@@ -227,24 +222,26 @@ def _detect_figure_pages(doc: DocumentContent) -> set[int]:
 
 
 def _detect_figure_pages_pymupdf(pdf_path: Path) -> set[int]:
-    """Detect pages with significant images using PyMuPDF."""
-    doc = pymupdf.open(pdf_path)
+    """Detect pages with significant images using pypdfium2."""
+    doc = pdfium.PdfDocument(pdf_path)
     pages: set[int] = set()
     for idx in range(len(doc)):
         page = doc[idx]
-        images = page.get_images(full=True)
-        if images:
-            page_area = page.rect.width * page.rect.height or 1.0
-            total_area = 0.0
-            for img_info in images:
+        page_area = page.get_width() * page.get_height() or 1.0
+        total_area = 0.0
+        image_count = 0
+        for obj in page.get_objects():
+            if obj.type == pdfium.FPDF_PAGEOBJ_IMAGE:
+                image_count += 1
                 try:
-                    for r in page.get_image_rects(img_info[0]):
-                        total_area += r.width * r.height
+                    left, bottom, right, top = obj.get_pos()
+                    total_area += abs((right - left) * (top - bottom))
                 except Exception:  # noqa: BLE001
                     total_area += page_area * 0.25
-            # Only count pages where images occupy >5% of the page
-            if total_area / page_area > 0.05:
-                pages.add(idx + 1)
+        # Only count pages where images occupy >5% of the page
+        if image_count > 0 and total_area / page_area > 0.05:
+            pages.add(idx + 1)
+        page.close()
     doc.close()
     return pages
 
@@ -256,14 +253,13 @@ def _detect_figure_pages_pymupdf(pdf_path: Path) -> set[int]:
 
 def _build_page_pdf(pdf_path: Path, page_numbers: list[int]) -> bytes:
     """Extract specific 1-based page numbers into a new PDF."""
-    doc = pymupdf.open(pdf_path)
-    out = pymupdf.open()
-    for pn in page_numbers:
-        out.insert_pdf(doc, from_page=pn - 1, to_page=pn - 1)
+    src = pdfium.PdfDocument(pdf_path)
+    out = pdfium.PdfDocument.new()
+    out.import_pages(src, [pn - 1 for pn in page_numbers])
     buf = io.BytesIO()
     out.save(buf)
     out.close()
-    doc.close()
+    src.close()
     return buf.getvalue()
 
 
@@ -662,7 +658,7 @@ def main() -> None:
     t = time.perf_counter()
     table_pages = _detect_table_pages_from_markdown(pass1_doc)
     if not table_pages:
-        print("  No tables detected in pass-1 response; scanning with PyMuPDF ...")
+        print("  No tables detected in pass-1 response; scanning PDF for tables ...")
         table_pages = _detect_table_pages_pymupdf(pdf_path)
     detect_table_time = time.perf_counter() - t
     timings.append(("Table detection", detect_table_time))
@@ -670,7 +666,7 @@ def main() -> None:
     t = time.perf_counter()
     figure_pages = _detect_figure_pages(pass1_doc)
     if not figure_pages:
-        print("  No figures detected in pass-1 response; scanning with PyMuPDF ...")
+        print("  No figures detected in pass-1 response; scanning PDF for images ...")
         figure_pages = _detect_figure_pages_pymupdf(pdf_path)
     detect_fig_time = time.perf_counter() - t
     timings.append(("Figure detection", detect_fig_time))

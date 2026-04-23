@@ -36,7 +36,7 @@ import sys
 import time
 from pathlib import Path
 
-import pymupdf  # PyMuPDF — PDF splitting
+import pypdfium2 as pdfium  # PDF splitting (Apache-2.0)
 from azure.ai.documentintelligence.aio import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import (
     AnalyzeOutputOption,
@@ -65,26 +65,22 @@ def _fmt_elapsed(secs: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _split_pdf(pdf_path: Path, chunk_size: int) -> list[tuple[bytes, int, int]]:
-    """Split *pdf_path* into chunks of *chunk_size* pages.
+def _get_total_pages(pdf_path: Path) -> int:
+    """Return the page count of *pdf_path* without splitting."""
+    src = pdfium.PdfDocument(pdf_path)
+    n = len(src)
+    src.close()
+    return n
 
-    Returns a list of (pdf_bytes, start_page_1based, end_page_1based).
-    """
-    doc = pymupdf.open(pdf_path)
-    total_pages = len(doc)
-    chunks: list[tuple[bytes, int, int]] = []
 
-    for start in range(0, total_pages, chunk_size):
-        end = min(start + chunk_size, total_pages) - 1  # 0-based inclusive
-        chunk_doc = pymupdf.open()  # new empty PDF
-        chunk_doc.insert_pdf(doc, from_page=start, to_page=end)
-        buf = io.BytesIO()
-        chunk_doc.save(buf)
-        chunk_doc.close()
-        chunks.append((buf.getvalue(), start + 1, end + 1))  # 1-based for display
-
-    doc.close()
-    return chunks
+def _split_one_chunk(src: pdfium.PdfDocument, start: int, end: int) -> bytes:
+    """Extract pages [start, end) from *src* and return them as PDF bytes."""
+    chunk_doc = pdfium.PdfDocument.new()
+    chunk_doc.import_pages(src, list(range(start, end)))
+    buf = io.BytesIO()
+    chunk_doc.save(buf)
+    chunk_doc.close()
+    return buf.getvalue()
 
 
 # ---------------------------------------------------------------------------
@@ -114,8 +110,7 @@ def _extract_result_id(poller) -> str | None:
 
 
 async def _analyze_chunk(
-    endpoint: str,
-    credential: DefaultAzureCredential,
+    client: DocumentIntelligenceClient,
     chunk_bytes: bytes,
     chunk_index: int,
     start_page: int,
@@ -125,29 +120,26 @@ async def _analyze_chunk(
 ) -> tuple[int, AnalyzeResult, str | None, float]:
     """Analyze one chunk. Returns (chunk_index, result, result_id, elapsed)."""
     async with semaphore:
-        async with DocumentIntelligenceClient(
-            endpoint=endpoint, credential=credential,
-        ) as client:
-            t0 = time.perf_counter()
-            print(f"  [chunk {chunk_index}] Submitting pages {start_page}–{end_page} "
-                  f"({len(chunk_bytes):,} bytes) ...")
+        t0 = time.perf_counter()
+        print(f"  [chunk {chunk_index}] Submitting pages {start_page}–{end_page} "
+              f"({len(chunk_bytes):,} bytes) ...")
 
-            poller = await client.begin_analyze_document(
-                model_id,
-                chunk_bytes,
-                output_content_format=DocumentContentFormat.MARKDOWN,
-                features=[DocumentAnalysisFeature.FORMULAS],
-                output=[AnalyzeOutputOption.FIGURES],
-            )
-            print(f"  [chunk {chunk_index}] Polling ...")
+        poller = await client.begin_analyze_document(
+            model_id,
+            chunk_bytes,
+            output_content_format=DocumentContentFormat.MARKDOWN,
+            features=[DocumentAnalysisFeature.FORMULAS],
+            output=[AnalyzeOutputOption.FIGURES],
+        )
+        print(f"  [chunk {chunk_index}] Polling ...")
 
-            result: AnalyzeResult = await poller.result()
-            elapsed = time.perf_counter() - t0
-            print(f"  [chunk {chunk_index}] Complete — pages {start_page}–{end_page} "
-                  f"in {_fmt_elapsed(elapsed)}")
+        result: AnalyzeResult = await poller.result()
+        elapsed = time.perf_counter() - t0
+        print(f"  [chunk {chunk_index}] Complete — pages {start_page}–{end_page} "
+              f"in {_fmt_elapsed(elapsed)}")
 
-            result_id = _extract_result_id(poller)
-            return chunk_index, result, result_id, elapsed
+        result_id = _extract_result_id(poller)
+        return chunk_index, result, result_id, elapsed
 
 
 # ---------------------------------------------------------------------------
@@ -250,8 +242,7 @@ def _save_figure_description(figure, figures_dir: Path) -> str:
 
 
 async def _download_figure_image(
-    endpoint: str,
-    credential: DefaultAzureCredential,
+    client: DocumentIntelligenceClient,
     model_id: str,
     result_id: str,
     figure,
@@ -261,32 +252,28 @@ async def _download_figure_image(
     """Download one figure image asynchronously. Returns a status message."""
     async with semaphore:
         try:
-            async with DocumentIntelligenceClient(
-                endpoint=endpoint, credential=credential,
-            ) as client:
-                response = await client.get_analyze_result_figure(
-                    model_id=model_id,
-                    result_id=result_id,
-                    figure_id=figure.id,
-                )
-                chunks: list[bytes] = []
-                async for chunk in response:
-                    chunks.append(chunk)
-                image_bytes = b"".join(chunks)
-                if not image_bytes:
-                    return None
-                stem = _safe_stem(figure.id)
-                out_path = figures_dir / f"figure_{stem}.png"
-                with open(out_path, "wb") as fh:
-                    fh.write(image_bytes)
-                return f"    [saved] {out_path.name}  ({len(image_bytes):,} bytes)"
+            response = await client.get_analyze_result_figure(
+                model_id=model_id,
+                result_id=result_id,
+                figure_id=figure.id,
+            )
+            chunks: list[bytes] = []
+            async for chunk in response:
+                chunks.append(chunk)
+            image_bytes = b"".join(chunks)
+            if not image_bytes:
+                return None
+            stem = _safe_stem(figure.id)
+            out_path = figures_dir / f"figure_{stem}.png"
+            with open(out_path, "wb") as fh:
+                fh.write(image_bytes)
+            return f"    [saved] {out_path.name}  ({len(image_bytes):,} bytes)"
         except Exception as exc:  # noqa: BLE001
             return f"    [info]  Image not available for figure {figure.id}: {exc}"
 
 
 async def _save_figures_async(
-    endpoint: str,
-    credential: DefaultAzureCredential,
+    client: DocumentIntelligenceClient,
     results: list[AnalyzeResult],
     model_id: str,
     result_ids: list[str | None],
@@ -320,7 +307,7 @@ async def _save_figures_async(
     for figure, rid in all_figures:
         if rid:
             tasks.append(_download_figure_image(
-                endpoint, credential, model_id, rid, figure, figures_dir, semaphore,
+                client, model_id, rid, figure, figures_dir, semaphore,
             ))
 
     if tasks:
@@ -352,85 +339,102 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     t_start = time.perf_counter()
 
-    # ---- split ----
-    t = time.perf_counter()
+    # ---- pipelined split + analysis ----
+    total_pages = _get_total_pages(pdf_path)
+    num_chunks = -(-total_pages // args.chunk_size)  # ceil division
     print(f"Splitting {pdf_path.name} into {args.chunk_size}-page chunks ...")
-    chunks = _split_pdf(pdf_path, args.chunk_size)
-    split_time = time.perf_counter() - t
-    total_pages = chunks[-1][2]
-    print(f"  {total_pages} pages → {len(chunks)} chunk(s) in {_fmt_elapsed(split_time)}\n")
+    print(f"  {total_pages} pages → {num_chunks} chunk(s)\n")
 
-    # ---- parallel async analysis ----
     credential = DefaultAzureCredential()
-    workers = min(args.workers, len(chunks))
-    semaphore = asyncio.Semaphore(workers)
-    print(f"Submitting {len(chunks)} chunk(s) with up to {workers} concurrent requests ...\n")
+    async with DocumentIntelligenceClient(
+        endpoint=endpoint, credential=credential,
+    ) as client:
+        workers = min(args.workers, num_chunks)
+        semaphore = asyncio.Semaphore(workers)
+        print(f"Submitting {num_chunks} chunk(s) with up to {workers} concurrent "
+              f"requests (pipelined split+submit) ...\n")
 
-    t_analysis = time.perf_counter()
-    tasks = [
-        _analyze_chunk(
-            endpoint, credential, chunk_bytes, idx,
-            start_page, end_page, args.model_id, semaphore,
+        t_pipeline = time.perf_counter()
+        split_time_accum = 0.0
+        tasks: list[asyncio.Task] = []
+        chunk_pages: list[tuple[int, int]] = []  # (start_page, end_page) per idx
+
+        src = pdfium.PdfDocument(pdf_path)
+        for idx, page_start in enumerate(range(0, total_pages, args.chunk_size)):
+            page_end = min(page_start + args.chunk_size, total_pages)
+            t_s = time.perf_counter()
+            chunk_bytes = _split_one_chunk(src, page_start, page_end)
+            split_time_accum += time.perf_counter() - t_s
+
+            start_page, end_page = page_start + 1, page_end
+            chunk_pages.append((start_page, end_page))
+
+            task = asyncio.create_task(_analyze_chunk(
+                client, chunk_bytes, idx,
+                start_page, end_page, args.model_id, semaphore,
+            ))
+            tasks.append(task)
+            await asyncio.sleep(0)  # yield so earlier tasks can start I/O
+        src.close()
+
+        chunk_raw_results = await asyncio.gather(*tasks)
+        pipeline_time = time.perf_counter() - t_pipeline
+        print(f"\nAll chunks complete in {_fmt_elapsed(pipeline_time)} wall-clock "
+              f"(split: {_fmt_elapsed(split_time_accum)} cumulative).\n")
+
+        # ---- order by chunk index ----
+        chunk_raw_results_sorted = sorted(chunk_raw_results, key=lambda x: x[0])
+        ordered_results: list[AnalyzeResult] = []
+        ordered_result_ids: list[str | None] = []
+        chunk_times: list[tuple[int, float]] = []
+        for chunk_idx, result, result_id, elapsed in chunk_raw_results_sorted:
+            ordered_results.append(result)
+            ordered_result_ids.append(result_id)
+            chunk_times.append((chunk_idx, elapsed))
+
+        if not ordered_results:
+            print("Error: no results returned from any chunk.", file=sys.stderr)
+            sys.exit(1)
+
+        # ---- summary ----
+        total_page_count = sum(len(r.pages) for r in ordered_results if r.pages)
+        total_table_count = sum(len(r.tables) for r in ordered_results if r.tables)
+        total_figure_count = sum(len(r.figures) for r in ordered_results if r.figures)
+        print(
+            f"Document: {total_page_count} page(s), {total_table_count} table(s), "
+            f"{total_figure_count} figure(s)\n"
+            f"Writing output to: {output_dir}\n"
         )
-        for idx, (chunk_bytes, start_page, end_page) in enumerate(chunks)
-    ]
-    chunk_raw_results = await asyncio.gather(*tasks)
-    analysis_time = time.perf_counter() - t_analysis
-    print(f"\nAll chunks complete in {_fmt_elapsed(analysis_time)} wall-clock.\n")
 
-    # ---- order by chunk index ----
-    chunk_raw_results_sorted = sorted(chunk_raw_results, key=lambda x: x[0])
-    ordered_results: list[AnalyzeResult] = []
-    ordered_result_ids: list[str | None] = []
-    chunk_times: list[tuple[int, float]] = []
-    for chunk_idx, result, result_id, elapsed in chunk_raw_results_sorted:
-        ordered_results.append(result)
-        ordered_result_ids.append(result_id)
-        chunk_times.append((chunk_idx, elapsed))
+        timings: list[tuple[str, float]] = [
+            ("PDF split (cum.)", split_time_accum),
+            ("Pipeline (wall)", pipeline_time),
+        ]
+        for chunk_idx, elapsed in chunk_times:
+            sp, ep = chunk_pages[chunk_idx]
+            timings.append((f"  chunk {chunk_idx} (p{sp}–{ep})", elapsed))
 
-    if not ordered_results:
-        print("Error: no results returned from any chunk.", file=sys.stderr)
-        sys.exit(1)
-
-    # ---- summary ----
-    total_page_count = sum(len(r.pages) for r in ordered_results if r.pages)
-    total_table_count = sum(len(r.tables) for r in ordered_results if r.tables)
-    total_figure_count = sum(len(r.figures) for r in ordered_results if r.figures)
-    print(
-        f"Document: {total_page_count} page(s), {total_table_count} table(s), "
-        f"{total_figure_count} figure(s)\n"
-        f"Writing output to: {output_dir}\n"
-    )
-
-    timings: list[tuple[str, float]] = [
-        ("PDF split", split_time),
-        ("Analysis (wall)", analysis_time),
-    ]
-    for chunk_idx, elapsed in chunk_times:
-        sp, ep = chunks[chunk_idx][1], chunks[chunk_idx][2]
-        timings.append((f"  chunk {chunk_idx} (p{sp}–{ep})", elapsed))
-
-    # ---- save outputs ----
-    t = time.perf_counter()
-    _save_json(ordered_results, output_dir)
-    timings.append(("Save JSON", time.perf_counter() - t))
-
-    t = time.perf_counter()
-    merged_md = _merge_markdown(ordered_results)
-    _save_markdown(merged_md, output_dir)
-    timings.append(("Save markdown", time.perf_counter() - t))
-
-    if args.save_extras:
+        # ---- save outputs ----
         t = time.perf_counter()
-        _save_tables(ordered_results, output_dir)
-        timings.append(("Save tables", time.perf_counter() - t))
+        _save_json(ordered_results, output_dir)
+        timings.append(("Save JSON", time.perf_counter() - t))
 
         t = time.perf_counter()
-        await _save_figures_async(
-            endpoint, credential, ordered_results, args.model_id,
-            ordered_result_ids, output_dir, max_workers=args.max_figure_workers,
-        )
-        timings.append(("Save figures", time.perf_counter() - t))
+        merged_md = _merge_markdown(ordered_results)
+        _save_markdown(merged_md, output_dir)
+        timings.append(("Save markdown", time.perf_counter() - t))
+
+        if args.save_extras:
+            t = time.perf_counter()
+            _save_tables(ordered_results, output_dir)
+            timings.append(("Save tables", time.perf_counter() - t))
+
+            t = time.perf_counter()
+            await _save_figures_async(
+                client, ordered_results, args.model_id,
+                ordered_result_ids, output_dir, max_workers=args.max_figure_workers,
+            )
+            timings.append(("Save figures", time.perf_counter() - t))
 
     await credential.close()
 
@@ -447,10 +451,10 @@ async def _async_main(args: argparse.Namespace) -> None:
 
     # Speedup estimate
     seq_time = sum(el for _, el in chunk_times)
-    if analysis_time > 0:
+    if pipeline_time > 0:
         print(f"\n  Sequential sum: {_fmt_elapsed(seq_time)}  |  "
-              f"Wall-clock: {_fmt_elapsed(analysis_time)}  |  "
-              f"Speedup: {seq_time / analysis_time:.1f}x")
+              f"Wall-clock: {_fmt_elapsed(pipeline_time)}  |  "
+              f"Speedup: {seq_time / pipeline_time:.1f}x")
 
     print("\nDone.")
 
@@ -493,8 +497,8 @@ def main() -> None:
     parser.add_argument(
         "--max-figure-workers",
         type=int,
-        default=8,
-        help="Max concurrent figure image downloads (default: 8).",
+        default=32,
+        help="Max concurrent figure image downloads (default: 32).",
     )
     parser.add_argument(
         "--save-extras",

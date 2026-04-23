@@ -30,7 +30,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import cast
 
-import pymupdf  # PyMuPDF
+import pypdfium2 as pdfium  # PDF splitting (Apache-2.0)
 from azure.ai.contentunderstanding import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import (
     AnalysisResult,
@@ -84,20 +84,20 @@ def _split_pdf(pdf_path: Path, chunk_size: int) -> list[tuple[bytes, int, int]]:
 
     Returns a list of (pdf_bytes, start_page_1based, end_page_1based).
     """
-    doc = pymupdf.open(pdf_path)
-    total_pages = len(doc)
+    src = pdfium.PdfDocument(pdf_path)
+    total_pages = len(src)
     chunks: list[tuple[bytes, int, int]] = []
 
     for start in range(0, total_pages, chunk_size):
-        end = min(start + chunk_size, total_pages) - 1  # 0-based inclusive
-        chunk_doc = pymupdf.open()  # new empty PDF
-        chunk_doc.insert_pdf(doc, from_page=start, to_page=end)
+        end = min(start + chunk_size, total_pages)  # exclusive
+        chunk_doc = pdfium.PdfDocument.new()
+        chunk_doc.import_pages(src, list(range(start, end)))
         buf = io.BytesIO()
         chunk_doc.save(buf)
         chunk_doc.close()
-        chunks.append((buf.getvalue(), start + 1, end + 1))  # 1-based for display
+        chunks.append((buf.getvalue(), start + 1, end))  # 1-based for display
 
-    doc.close()
+    src.close()
     return chunks
 
 

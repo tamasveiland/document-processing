@@ -33,6 +33,10 @@ bld/
 [Oo]ut/
 [Ll]og/
 [Ll]ogs/
+[SsRrCc]/output/
+src/output/
+[Bb]in/
+src/.venv/
 
 # Build results on 'Bin' directories
 **/[Bb]in/*

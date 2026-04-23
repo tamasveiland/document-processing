@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
-import pymupdf  # PyMuPDF
+import pypdfium2 as pdfium  # PDF page extraction (Apache-2.0)
 from azure.ai.contentunderstanding import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import (
     AnalysisResult,
@@ -148,7 +148,7 @@ def _build_submission_units(
 
 
 def _get_page_count(pdf_path: Path) -> int:
-    doc = pymupdf.open(pdf_path)
+    doc = pdfium.PdfDocument(pdf_path)
     count = len(doc)
     doc.close()
     return count
@@ -156,14 +156,13 @@ def _get_page_count(pdf_path: Path) -> int:
 
 def _extract_pages(pdf_path: Path, page_numbers: list[int]) -> bytes:
     """Extract 1-based page numbers into a new in-memory PDF."""
-    doc = pymupdf.open(pdf_path)
-    out = pymupdf.open()
-    for pn in page_numbers:
-        out.insert_pdf(doc, from_page=pn - 1, to_page=pn - 1)
+    src = pdfium.PdfDocument(pdf_path)
+    out = pdfium.PdfDocument.new()
+    out.import_pages(src, [pn - 1 for pn in page_numbers])
     buf = io.BytesIO()
     out.save(buf)
     out.close()
-    doc.close()
+    src.close()
     return buf.getvalue()
 
 
