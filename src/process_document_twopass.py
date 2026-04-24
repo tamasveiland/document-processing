@@ -28,18 +28,19 @@ Auth
 from __future__ import annotations
 
 import argparse
+import asyncio
 import io
 import json
 import os
 import re
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import cast
 
 import pypdfium2 as pdfium  # PDF operations (Apache-2.0)
-from azure.ai.contentunderstanding import ContentUnderstandingClient
+import pypdfium2.raw as pdfium_c
+from azure.ai.contentunderstanding.aio import ContentUnderstandingClient
 from azure.ai.contentunderstanding.models import (
     AnalysisResult,
     DocumentChartFigure,
@@ -47,7 +48,7 @@ from azure.ai.contentunderstanding.models import (
     DocumentFigure,
     DocumentMermaidFigure,
 )
-from azure.identity import DefaultAzureCredential
+from azure.identity.aio import DefaultAzureCredential
 from dotenv import load_dotenv
 
 
@@ -68,7 +69,7 @@ def _fmt_elapsed(secs: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _pass1_layout(
+async def _pass1_layout(
     client: ContentUnderstandingClient,
     pdf_bytes: bytes,
 ) -> tuple[AnalysisResult, str, float, dict | None]:
@@ -77,16 +78,16 @@ def _pass1_layout(
     Returns (result, operation_id, elapsed_secs, usage).
     """
     t0 = time.perf_counter()
-    print("Pass 1 — submitting full document to prebuilt-read ...")
+    print("Pass 1 — submitting full document to prebuilt-layout ...")
 
-    poller = client.begin_analyze_binary(
-        analyzer_id="prebuilt-read",
+    poller = await client.begin_analyze_binary(
+        analyzer_id="prebuilt-layout",
         binary_input=pdf_bytes,
     )
     op_id: str = poller.operation_id
     print(f"  Operation {op_id}  (polling ...)")
 
-    result: AnalysisResult = poller.result()
+    result: AnalysisResult = await poller.result()
     elapsed = time.perf_counter() - t0
     print(f"  Pass 1 complete in {_fmt_elapsed(elapsed)}.")
 
@@ -128,8 +129,10 @@ def _detect_figure_pages(doc: DocumentContent) -> set[int]:
     if not pages and doc.markdown:
         # If the markdown has page breaks, use them to identify figure pages.
         # Common format: "<!-- PageBreak -->" or "---" as a separator
+        # NOTE: use non-capturing group (?:...) so re.split doesn't inject
+        #       captured values into the result list and inflate indices.
         page_sections = re.split(
-            r"<!-- *PageBreak *-->|<!-- *PageNumber=\"(\d+)\" *-->",
+            r"<!-- *PageBreak *-->|<!-- *PageNumber=\"(?:\d+)\" *-->",
             doc.markdown,
         )
         for i, section in enumerate(page_sections):
@@ -140,30 +143,30 @@ def _detect_figure_pages(doc: DocumentContent) -> set[int]:
     return pages
 
 
-def _detect_figure_pages_pymupdf(pdf_path: Path) -> set[int]:
-    """Detect pages with images using pypdfium2 as a last-resort fallback."""
-    doc = pdfium.PdfDocument(pdf_path)
-    pages: set[int] = set()
-    for idx in range(len(doc)):
-        page = doc[idx]
-        page_area = page.get_width() * page.get_height() or 1.0
-        total_area = 0.0
-        image_count = 0
-        for obj in page.get_objects():
-            if obj.type == pdfium.FPDF_PAGEOBJ_IMAGE:
-                image_count += 1
-                try:
-                    left, bottom, right, top = obj.get_pos()
-                    total_area += abs((right - left) * (top - bottom))
-                except Exception:  # noqa: BLE001
-                    total_area += page_area * 0.25
-        # Only count pages where images occupy >5% of the page
-        # (filters out tiny logos/decorations)
-        if image_count > 0 and total_area / page_area > 0.05:
-            pages.add(idx + 1)
-        page.close()
-    doc.close()
-    return pages
+# def _detect_figure_pages_pymupdf(pdf_path: Path) -> set[int]:
+#     """Detect pages with images using pypdfium2 as a last-resort fallback."""
+#     doc = pdfium.PdfDocument(pdf_path)
+#     pages: set[int] = set()
+#     for idx in range(len(doc)):
+#         page = doc[idx]
+#         page_area = page.get_width() * page.get_height() or 1.0
+#         total_area = 0.0
+#         image_count = 0
+#         for obj in page.get_objects():
+#             if obj.type == pdfium_c.FPDF_PAGEOBJ_IMAGE:
+#                 image_count += 1
+#                 try:
+#                     left, bottom, right, top = obj.get_pos()
+#                     total_area += abs((right - left) * (top - bottom))
+#                 except Exception:  # noqa: BLE001
+#                     total_area += page_area * 0.25
+#         # Only count pages where images occupy >5% of the page
+#         # (filters out tiny logos/decorations)
+#         if image_count > 0 and total_area / page_area > 0.05:
+#             pages.add(idx + 1)
+#         page.close()
+#     doc.close()
+#     return pages
 
 
 # ---------------------------------------------------------------------------
@@ -171,45 +174,45 @@ def _detect_figure_pages_pymupdf(pdf_path: Path) -> set[int]:
 # ---------------------------------------------------------------------------
 
 
-def _build_page_pdf(pdf_path: Path, page_numbers: list[int]) -> bytes:
-    """Extract specific 1-based page numbers into a new PDF."""
-    src = pdfium.PdfDocument(pdf_path)
+def _build_page_pdf(src: pdfium.PdfDocument, page_numbers: list[int]) -> bytes:
+    """Extract specific 1-based page numbers from *src* into a new PDF."""
     out = pdfium.PdfDocument.new()
     out.import_pages(src, [pn - 1 for pn in page_numbers])
     buf = io.BytesIO()
     out.save(buf)
     out.close()
-    src.close()
     return buf.getvalue()
 
 
-def _analyze_chunk(
-    endpoint: str,
-    credential: DefaultAzureCredential,
+async def _analyze_chunk(
+    client: ContentUnderstandingClient,
     chunk_bytes: bytes,
     chunk_index: int,
     page_label: str,
+    semaphore: asyncio.Semaphore,
+    timeout: float = 300,
 ) -> tuple[int, AnalysisResult, str, float, dict | None]:
-    client = ContentUnderstandingClient(endpoint=endpoint, credential=credential)
+    async with semaphore:
+        t0 = time.perf_counter()
+        print(f"  [pass2 chunk {chunk_index:>2}] Submitting {page_label} "
+              f"({len(chunk_bytes):,} bytes) ...")
 
-    t0 = time.perf_counter()
-    print(f"  [pass2 chunk {chunk_index:>2}] Submitting {page_label} "
-          f"({len(chunk_bytes):,} bytes) ...")
+        poller = await client.begin_analyze_binary(
+            analyzer_id="prebuilt-documentSearch",
+            binary_input=chunk_bytes,
+        )
+        op_id: str = poller.operation_id
+        print(f"  [pass2 chunk {chunk_index:>2}] Operation {op_id}  (polling ...)")
 
-    poller = client.begin_analyze_binary(
-        analyzer_id="prebuilt-documentSearch",
-        binary_input=chunk_bytes,
-    )
-    op_id: str = poller.operation_id
-    print(f"  [pass2 chunk {chunk_index:>2}] Operation {op_id}  (polling ...)")
+        result: AnalysisResult = await asyncio.wait_for(
+            poller.result(), timeout=timeout,
+        )
+        elapsed = time.perf_counter() - t0
+        print(f"  [pass2 chunk {chunk_index:>2}] Complete — {page_label} "
+              f"in {_fmt_elapsed(elapsed)}")
 
-    result: AnalysisResult = poller.result()
-    elapsed = time.perf_counter() - t0
-    print(f"  [pass2 chunk {chunk_index:>2}] Complete — {page_label} "
-          f"in {_fmt_elapsed(elapsed)}")
-
-    usage = _extract_usage(poller)
-    return chunk_index, result, op_id, elapsed, usage
+        usage = _extract_usage(poller)
+        return chunk_index, result, op_id, elapsed, usage
 
 
 def _group_consecutive(pages: list[int], max_group: int = 4) -> list[list[int]]:
@@ -225,6 +228,21 @@ def _group_consecutive(pages: list[int], max_group: int = 4) -> list[list[int]]:
             groups.append(current)
             current = [p]
     groups.append(current)
+    return groups
+
+
+def _batch_pages(pages: list[int], batch_size: int) -> list[list[int]]:
+    """Split sorted page numbers into fixed-size batches (pages need not be consecutive)."""
+    return [pages[i:i + batch_size] for i in range(0, len(pages), batch_size)]
+
+
+def _page_label(grp: list[int]) -> str:
+    """Human-readable label for a group of page numbers."""
+    if len(grp) == 1:
+        return f"p{grp[0]}"
+    if grp[-1] == grp[0] + len(grp) - 1:  # consecutive
+        return f"p{grp[0]}\u2013{grp[-1]}"
+    return f"p{','.join(map(str, grp))}"
     return groups
 
 
@@ -377,31 +395,38 @@ def _save_figure_description(figure: DocumentFigure, figures_dir: Path) -> None:
     print(f"    [saved] {path.name}")
 
 
-def _try_download_figure_image(
+async def _try_download_figure_image(
     client: ContentUnderstandingClient,
     operation_id: str,
     figure: DocumentFigure,
     figures_dir: Path,
-) -> None:
-    try:
-        response = client.get_result_file(operation_id=operation_id, path=f"figures/{figure.id}")
-        image_bytes = b"".join(response)
-        if not image_bytes:
-            return
-        stem = _safe_stem(figure.id)
-        out_path = figures_dir / f"figure_{stem}.png"
-        with open(out_path, "wb") as fh:
-            fh.write(image_bytes)
-        print(f"    [saved] {out_path.name}  ({len(image_bytes):,} bytes)")
-    except Exception as exc:  # noqa: BLE001
-        print(f"    [info]  Image not available for figure {figure.id}: {exc}")
+    semaphore: asyncio.Semaphore,
+) -> str | None:
+    """Download one figure image asynchronously. Returns a status message."""
+    async with semaphore:
+        try:
+            response = await client.get_result_file(operation_id=operation_id, path=f"figures/{figure.id}")
+            chunks: list[bytes] = []
+            async for chunk in response:
+                chunks.append(chunk)
+            image_bytes = b"".join(chunks)
+            if not image_bytes:
+                return None
+            stem = _safe_stem(figure.id)
+            out_path = figures_dir / f"figure_{stem}.png"
+            with open(out_path, "wb") as fh:
+                fh.write(image_bytes)
+            return f"    [saved] {out_path.name}  ({len(image_bytes):,} bytes)"
+        except Exception as exc:  # noqa: BLE001
+            return f"    [info]  Image not available for figure {figure.id}: {exc}"
 
 
-def _save_figures(
+async def _save_figures(
     client: ContentUnderstandingClient,
     pass2_docs: list[DocumentContent],
     pass2_op_ids: list[str],
     output_dir: Path,
+    max_workers: int = 16,
 ) -> None:
     figures_dir = output_dir / "figures"
     figures_dir.mkdir(exist_ok=True)
@@ -410,12 +435,214 @@ def _save_figures(
     if not all_figures:
         print("  No figures found in pass 2; skipping figures/")
         return
-    print(f"  Processing {len(all_figures)} figure(s) from pass 2 ...")
-    for figure, op_id in all_figures:
-        t_fig = time.perf_counter()
+    print(f"  Processing {len(all_figures)} figure(s) from pass 2 "
+          f"(up to {max_workers} concurrent downloads) ...")
+
+    # Save descriptions synchronously (fast, local I/O)
+    for figure, _op_id in all_figures:
         _save_figure_description(figure, figures_dir)
-        _try_download_figure_image(client, op_id, figure, figures_dir)
-        print(f"    [time]  {figure.id}: {_fmt_elapsed(time.perf_counter() - t_fig)}")
+
+    # Download images concurrently
+    semaphore = asyncio.Semaphore(max_workers)
+    tasks = [
+        _try_download_figure_image(client, op_id, figure, figures_dir, semaphore)
+        for figure, op_id in all_figures
+    ]
+    dl_results = await asyncio.gather(*tasks)
+    for msg in dl_results:
+        if msg:
+            print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Main async workflow
+# ---------------------------------------------------------------------------
+
+
+async def _async_main(args: argparse.Namespace) -> None:
+    pdf_path = Path(args.pdf_path).resolve()
+    if not pdf_path.is_file():
+        print(f"Error: file not found: {pdf_path}", file=sys.stderr)
+        sys.exit(1)
+
+    output_dir = Path(args.output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    t_start = time.perf_counter()
+
+    # ---- Read PDF ----
+    print(f"Reading {pdf_path.name} ...")
+    with open(pdf_path, "rb") as fh:
+        pdf_bytes = fh.read()
+    print(f"  {len(pdf_bytes):,} bytes\n")
+
+    load_dotenv()
+    endpoint = os.environ.get("AZURE_CONTENT_UNDERSTANDING_ENDPOINT", "")
+    if not endpoint:
+        print("Error: AZURE_CONTENT_UNDERSTANDING_ENDPOINT is not set.", file=sys.stderr)
+        sys.exit(1)
+
+    credential = DefaultAzureCredential()
+    async with ContentUnderstandingClient(
+        endpoint=endpoint, credential=credential,
+    ) as client:
+
+        all_usages: list[dict | None] = []
+        timings: list[tuple[str, float]] = []
+
+        # ==== PASS 1 — Fast layout ====
+        pass1_result, pass1_op_id, pass1_time, pass1_usage = await _pass1_layout(client, pdf_bytes)
+        timings.append(("Pass 1 (layout)", pass1_time))
+        all_usages.append(pass1_usage)
+
+        if not pass1_result.contents:
+            print("Error: empty response from pass 1.", file=sys.stderr)
+            sys.exit(1)
+
+        pass1_doc = cast(DocumentContent, pass1_result.contents[0])
+        print(
+            f"\n  Document: {pass1_doc.mime_type or 'unknown'}  "
+            f"pages {pass1_doc.start_page_number}\u2013{pass1_doc.end_page_number}"
+        )
+
+        # ---- Detect figure pages ----
+        t = time.perf_counter()
+        figure_pages = _detect_figure_pages(pass1_doc)
+        if not figure_pages:
+            # Fall back to pypdfium2 image detection
+            print("  No figures detected in pass-1 response; scanning PDF for images ...")
+            # figure_pages = _detect_figure_pages_pymupdf(pdf_path)
+        detect_time = time.perf_counter() - t
+        timings.append(("Figure detection", detect_time))
+
+        total_pages = (pass1_doc.end_page_number or 0) - (pass1_doc.start_page_number or 1) + 1
+        figure_page_list = sorted(p for p in figure_pages if 1 <= p <= total_pages)
+        print(f"  {len(figure_page_list)} of {total_pages} pages contain figures"
+              f"  ({', '.join(map(str, figure_page_list[:20]))}{'...' if len(figure_page_list) > 20 else ''})\n")
+
+        # ---- Start saving pass-1 outputs while pass-2 runs ----
+        async def _save_pass1_outputs() -> list[tuple[str, float]]:
+            """Save pass-1 outputs (runs concurrently with pass 2)."""
+            t_timings: list[tuple[str, float]] = []
+            t0 = time.perf_counter()
+            _save_markdown(pass1_doc, output_dir)
+            t_timings.append(("Save markdown", time.perf_counter() - t0))
+            if args.save_extras:
+                t0 = time.perf_counter()
+                _save_tables(pass1_doc, output_dir)
+                t_timings.append(("Save tables", time.perf_counter() - t0))
+            return t_timings
+
+        save_pass1_task = asyncio.create_task(_save_pass1_outputs())
+
+        # ==== PASS 2 — Targeted rich analysis (only figure pages) ====
+        pass2_results: list[AnalysisResult] = []
+        pass2_op_ids: list[str] = []
+        pass2_docs: list[DocumentContent] = []
+        chunk_labels: list[str] = []
+
+        if figure_page_list:
+            page_groups = _batch_pages(figure_page_list, args.figure_group_size)
+            print(f"Pass 2 \u2014 submitting {len(page_groups)} chunk(s) covering "
+                  f"{len(figure_page_list)} figure pages to prebuilt-documentSearch ...\n")
+
+            workers = min(args.workers, len(page_groups))
+            semaphore = asyncio.Semaphore(workers)
+
+            # Pre-build all chunk PDFs (sync) before async submission,
+            # so all pypdfium2 C-library calls finish before the event
+            # loop processes HTTP tasks.
+            t_pass2 = time.perf_counter()
+            src = pdfium.PdfDocument(pdf_path)
+            chunk_data: list[tuple[bytes, str]] = []
+            for grp in page_groups:
+                chunk_pdf = _build_page_pdf(src, grp)
+                label = _page_label(grp)
+                chunk_data.append((chunk_pdf, label))
+            src.close()
+
+            # Now submit all chunks asynchronously
+            chunk_timeout = args.chunk_timeout
+            tasks: list[asyncio.Task] = []
+            for idx, (chunk_bytes, label) in enumerate(chunk_data):
+                chunk_labels.append(label)
+                task = asyncio.create_task(
+                    _analyze_chunk(client, chunk_bytes, idx, label, semaphore,
+                                   timeout=chunk_timeout)
+                )
+                tasks.append(task)
+                await asyncio.sleep(0)  # yield so earlier tasks can start I/O
+
+            chunk_raw_results = await asyncio.gather(*tasks, return_exceptions=True)
+            pass2_time = time.perf_counter() - t_pass2
+            timings.append(("Pass 2 (figures, wall)", pass2_time))
+
+            # Separate successes from failures
+            successes: list[tuple[int, AnalysisResult, str, float, dict | None]] = []
+            for r in chunk_raw_results:
+                if isinstance(r, BaseException):
+                    idx_hint = chunk_raw_results.index(r)
+                    label_hint = chunk_labels[idx_hint] if idx_hint < len(chunk_labels) else "?"
+                    print(f"  [pass2 chunk {idx_hint:>2}] FAILED ({label_hint}): {r}")
+                else:
+                    successes.append(r)
+
+            # Order by chunk index
+            for chunk_idx, result, op_id, elapsed, usage in sorted(successes, key=lambda x: x[0]):
+                pass2_results.append(result)
+                pass2_op_ids.append(op_id)
+                all_usages.append(usage)
+                timings.append((f"  pass2 chunk {chunk_idx} ({chunk_labels[chunk_idx]})", elapsed))
+                if result.contents:
+                    pass2_docs.append(cast(DocumentContent, result.contents[0]))
+
+            seq_time = sum(r[3] for r in successes)
+            failed_count = len(chunk_raw_results) - len(successes)
+            summary = (f"\nPass 2 complete in {_fmt_elapsed(pass2_time)} wall-clock  "
+                       f"(sequential sum: {_fmt_elapsed(seq_time)}, "
+                       f"speedup: {seq_time / pass2_time:.1f}x)")
+            if failed_count:
+                summary += f"  [{failed_count} chunk(s) timed out]"
+            print(summary + "\n")
+        else:
+            print("Pass 2 \u2014 skipped (no figure pages detected).\n")
+
+        # ---- Await pass-1 save completion ----
+        pass1_save_timings = await save_pass1_task
+        timings.extend(pass1_save_timings)
+
+        # ---- Save remaining outputs (depend on pass-2 results) ----
+        print(f"Writing output to: {output_dir}\n")
+
+        t = time.perf_counter()
+        _save_json(pass1_result, pass2_results, output_dir)
+        timings.append(("Save JSON", time.perf_counter() - t))
+
+        if args.save_extras and pass2_docs:
+            t = time.perf_counter()
+            await _save_figures(
+                client, pass2_docs, pass2_op_ids, output_dir,
+                max_workers=args.max_figure_workers,
+            )
+            timings.append(("Save figures", time.perf_counter() - t))
+
+    await credential.close()
+
+    # ---- Summary ----
+    total = time.perf_counter() - t_start
+    _SEP = "\u2500" * 60
+    print(f"\n{_SEP}")
+    print("  Timing summary")
+    print(_SEP)
+    for label, elapsed in timings:
+        print(f"  {label:<30s}  {elapsed:9.2f}s  ({_fmt_elapsed(elapsed)})")
+    print(_SEP)
+    print(f"  {'Total':<30s}  {total:9.2f}s  ({_fmt_elapsed(total)})")
+    print(_SEP)
+
+    _print_usage(_merge_usage(all_usages), "Usage details (pass 1 + pass 2 combined)")
+
+    print("\nDone.")
 
 
 # ---------------------------------------------------------------------------
@@ -444,159 +671,21 @@ def main() -> None:
         help="Max consecutive figure-pages per pass-2 chunk (default: 4).",
     )
     parser.add_argument(
+        "--max-figure-workers", type=int, default=16,
+        help="Max concurrent figure image downloads (default: 16).",
+    )
+    parser.add_argument(
+        "--chunk-timeout", type=float, default=300,
+        help="Per-chunk timeout in seconds (default: 300). "
+             "Chunks that exceed this are skipped.",
+    )
+    parser.add_argument(
         "--save-extras", action="store_true", default=False,
         help="Also save tables.md and figures/*.",
     )
     args = parser.parse_args()
 
-    pdf_path = Path(args.pdf_path).resolve()
-    if not pdf_path.is_file():
-        print(f"Error: file not found: {pdf_path}", file=sys.stderr)
-        sys.exit(1)
-
-    output_dir = Path(args.output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    t_start = time.perf_counter()
-
-    # ---- Read PDF ----
-    print(f"Reading {pdf_path.name} ...")
-    with open(pdf_path, "rb") as fh:
-        pdf_bytes = fh.read()
-    print(f"  {len(pdf_bytes):,} bytes\n")
-
-    load_dotenv()
-    endpoint = os.environ.get("AZURE_CONTENT_UNDERSTANDING_ENDPOINT", "")
-    if not endpoint:
-        print("Error: AZURE_CONTENT_UNDERSTANDING_ENDPOINT is not set.", file=sys.stderr)
-        sys.exit(1)
-    credential = DefaultAzureCredential()
-    client = ContentUnderstandingClient(endpoint=endpoint, credential=credential)
-
-    all_usages: list[dict | None] = []
-    timings: list[tuple[str, float]] = []
-
-    # ==== PASS 1 — Fast layout ====
-    pass1_result, pass1_op_id, pass1_time, pass1_usage = _pass1_layout(client, pdf_bytes)
-    timings.append(("Pass 1 (layout)", pass1_time))
-    all_usages.append(pass1_usage)
-
-    if not pass1_result.contents:
-        print("Error: empty response from pass 1.", file=sys.stderr)
-        sys.exit(1)
-
-    pass1_doc = cast(DocumentContent, pass1_result.contents[0])
-    print(
-        f"\n  Document: {pass1_doc.mime_type or 'unknown'}  "
-        f"pages {pass1_doc.start_page_number}–{pass1_doc.end_page_number}"
-    )
-
-    # ---- Detect figure pages ----
-    t = time.perf_counter()
-    figure_pages = _detect_figure_pages(pass1_doc)
-    if not figure_pages:
-        # Fall back to PyMuPDF image detection
-        print("  No figures detected in pass-1 response; scanning PDF for images ...")
-        figure_pages = _detect_figure_pages_pymupdf(pdf_path)
-    detect_time = time.perf_counter() - t
-    timings.append(("Figure detection", detect_time))
-
-    total_pages = (pass1_doc.end_page_number or 0) - (pass1_doc.start_page_number or 1) + 1
-    figure_page_list = sorted(figure_pages)
-    print(f"  {len(figure_page_list)} of {total_pages} pages contain figures"
-          f"  ({', '.join(map(str, figure_page_list[:20]))}{'...' if len(figure_page_list) > 20 else ''})\n")
-
-    # ==== PASS 2 — Targeted rich analysis (only figure pages) ====
-    pass2_results: list[AnalysisResult] = []
-    pass2_op_ids: list[str] = []
-    pass2_docs: list[DocumentContent] = []
-
-    if figure_page_list:
-        page_groups = _group_consecutive(figure_page_list, args.figure_group_size)
-        print(f"Pass 2 — submitting {len(page_groups)} chunk(s) covering "
-              f"{len(figure_page_list)} figure pages to prebuilt-documentSearch ...\n")
-
-        # Build chunk PDFs
-        chunk_data: list[tuple[bytes, str]] = []
-        for grp in page_groups:
-            chunk_pdf = _build_page_pdf(pdf_path, grp)
-            label = f"p{grp[0]}" if len(grp) == 1 else f"p{grp[0]}–{grp[-1]}"
-            chunk_data.append((chunk_pdf, label))
-
-        pass2_chunk_results: dict[int, tuple[int, AnalysisResult, str, float, dict | None]] = {}
-        t_pass2 = time.perf_counter()
-
-        workers = min(args.workers, len(chunk_data))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _analyze_chunk, endpoint, credential,
-                    chunk_pdf, idx, label,
-                ): idx
-                for idx, (chunk_pdf, label) in enumerate(chunk_data)
-            }
-            for future in as_completed(futures):
-                idx, result, op_id, elapsed, usage = future.result()
-                pass2_chunk_results[idx] = (idx, result, op_id, elapsed, usage)
-
-        pass2_time = time.perf_counter() - t_pass2
-        timings.append(("Pass 2 (figures, wall)", pass2_time))
-
-        # Order by chunk index
-        for idx in range(len(chunk_data)):
-            _, result, op_id, elapsed, usage = pass2_chunk_results[idx]
-            pass2_results.append(result)
-            pass2_op_ids.append(op_id)
-            all_usages.append(usage)
-            label = chunk_data[idx][1]
-            timings.append((f"  pass2 chunk {idx} ({label})", elapsed))
-
-            if result.contents:
-                pass2_docs.append(cast(DocumentContent, result.contents[0]))
-
-        seq_time = sum(pass2_chunk_results[i][3] for i in range(len(chunk_data)))
-        print(f"\nPass 2 complete in {_fmt_elapsed(pass2_time)} wall-clock  "
-              f"(sequential sum: {_fmt_elapsed(seq_time)}, "
-              f"speedup: {seq_time / pass2_time:.1f}x)\n")
-    else:
-        print("Pass 2 — skipped (no figure pages detected).\n")
-
-    # ---- Save outputs ----
-    print(f"Writing output to: {output_dir}\n")
-
-    t = time.perf_counter()
-    _save_json(pass1_result, pass2_results, output_dir)
-    timings.append(("Save JSON", time.perf_counter() - t))
-
-    t = time.perf_counter()
-    _save_markdown(pass1_doc, output_dir)
-    timings.append(("Save markdown", time.perf_counter() - t))
-
-    if args.save_extras:
-        t = time.perf_counter()
-        _save_tables(pass1_doc, output_dir)
-        timings.append(("Save tables", time.perf_counter() - t))
-
-        if pass2_docs:
-            t = time.perf_counter()
-            _save_figures(client, pass2_docs, pass2_op_ids, output_dir)
-            timings.append(("Save figures", time.perf_counter() - t))
-
-    # ---- Summary ----
-    total = time.perf_counter() - t_start
-    _SEP = "\u2500" * 60
-    print(f"\n{_SEP}")
-    print("  Timing summary")
-    print(_SEP)
-    for label, elapsed in timings:
-        print(f"  {label:<30s}  {elapsed:9.2f}s  ({_fmt_elapsed(elapsed)})")
-    print(_SEP)
-    print(f"  {'Total':<30s}  {total:9.2f}s  ({_fmt_elapsed(total)})")
-    print(_SEP)
-
-    _print_usage(_merge_usage(all_usages), "Usage details (pass 1 + pass 2 combined)")
-
-    print("\nDone.")
+    asyncio.run(_async_main(args))
 
 
 if __name__ == "__main__":
